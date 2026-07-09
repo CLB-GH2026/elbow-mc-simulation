@@ -32,7 +32,7 @@ Source positions (default):
 
 Dependencies:
     pip install numpy trimesh pmcx plotly scipy
-    pip install git+https://github.com/CLB-GH2026/pbm-mc-core.git@v0.1.0
+    pip install git+https://github.com/CLB-GH2026/pbm-mc-core.git@v0.1.1
 """
 
 import time
@@ -40,7 +40,6 @@ from pathlib import Path
 from datetime import datetime
 
 import numpy as np
-import plotly.graph_objects as go
 
 from pbm_mc_core import (
     opt, EPIDERMIS_LABEL, build_melanin_conditions,
@@ -49,9 +48,17 @@ from pbm_mc_core import (
     find_joint_line_z, find_surface_source_positions,
     optimize_source_positions_reciprocity,
     run_pmcx,
-    analyze_fluence_absorption, analyze_penetration_depth,
+    analyze_fluence_absorption, analyze_penetration_depth, plot_depth_histogram,
     results_to_csv, melanin_comparison_to_csv,
 )
+
+# Elbow anatomy depth references (approximate, lateral access) — NOT knee's
+# zone; the elbow is the shallowest of the four joints (see CLAUDE.md: skin
+# ~0.5 cm, muscle ~1 cm, joint ~2 cm), so this must be passed explicitly to
+# pbm_mc_core.plot_depth_histogram (see its docstring — depth_refs/zone_lo/
+# zone_hi default to knee's much deeper values otherwise).
+_ELBOW_DEPTH_REFS = [(0.5, 'Skin/Adipose'), (1.0, 'Muscle'), (2.0, 'Elbow Joint')]
+_ELBOW_ZONE_LO, _ELBOW_ZONE_HI = 1.0, 2.5
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. CONFIGURATION
@@ -260,6 +267,11 @@ def run_subject(subject_id, mesh_dir_base, output_dir, melanin_condition='fair')
         cart_flu_mw = (sum(results[n]['mean_flu'] * results[n]['n_voxels']
                            for n in cart_names) / cart_vox) if cart_vox > 0 else 0.0
 
+        annular_names  = [n for n in results if 'annular' in n]
+        annular_vox    = sum(results[n]['n_voxels'] for n in annular_names)
+        annular_flu_mw = (sum(results[n]['mean_flu'] * results[n]['n_voxels']
+                              for n in annular_names) / annular_vox) if annular_vox > 0 else 0.0
+
         syn_names   = [n for n in results if 'synovial' in n]
         syn_vox     = sum(results[n]['n_voxels'] for n in syn_names)
         syn_flu_mw  = (sum(results[n]['mean_flu'] * results[n]['n_voxels']
@@ -271,8 +283,13 @@ def run_subject(subject_id, mesh_dir_base, output_dir, melanin_condition='fair')
         )
         fig_depth = plot_depth_histogram(
             bin_centers, mean_flu, subject_id, WAVELENGTH_NM,
-            cartilage_flu_mw=cart_flu_mw,
-            synovial_flu_mw=syn_flu_mw,
+            depth_refs=_ELBOW_DEPTH_REFS,
+            zone_lo=_ELBOW_ZONE_LO, zone_hi=_ELBOW_ZONE_HI,
+            group_flu_mw={
+                'Cartilage': cart_flu_mw,
+                'Annular Ligament': annular_flu_mw,
+                'Synovial Fluid': syn_flu_mw,
+            },
         )
         depth_html = str(subj_dir / f"depth_histogram_{subject_id}_{melanin_condition}.html")
         fig_depth.write_html(depth_html)
@@ -312,98 +329,6 @@ def _default_src_configs(jl_z):
         {'name': 'Posterior', 'world_pos': [  0, -35, jl_z], 'color': 'green'},
         {'name': 'Medial',    'world_pos': [-35,   0, jl_z], 'color': 'blue' },
     ]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# NOTE: plot_depth_histogram is kept LOCAL rather than imported from
-# pbm_mc_core. The shared library's analysis.plot_depth_histogram hardcodes
-# knee-anatomy depth references (DEPTH_REFS at 0.8/2.0/3.5 cm, dose zone
-# 2.0-3.5 cm) that are not exposed as parameters. The elbow is explicitly the
-# shallowest of the four joints (see CLAUDE.md: skin ~0.5 cm, muscle ~1 cm,
-# joint ~2 cm) — using the library version verbatim would silently replace
-# elbow's correct depth references/dose zone with knee's. Only the
-# `wavelength_nm` parameter (the one genuine bug: the title previously read
-# "... Shoulder" and, in the 650 nm script, was hardcoded to 808) has been
-# adopted from the library's fix.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def plot_depth_histogram(bin_centers, mean_flu, subject_id, wavelength_nm,
-                          bin_width_cm=0.25, treatment_times_s=(300, 600, 900),
-                          cartilage_flu_mw=0.0, synovial_flu_mw=0.0):
-    # Elbow anatomy depth references (approximate, lateral access):
-    #   ~0.5 cm  skin + adipose (very thin laterally)
-    #   ~1.0 cm  muscle / extensor origin
-    #   ~2.0 cm  lateral elbow joint space
-    DEPTH_REFS  = [(0.5, 'Skin/Adipose'), (1.0, 'Muscle'), (2.0, 'Elbow Joint')]
-    ZONE_LO, ZONE_HI = 1.0, 2.5
-
-    bin_centers = np.asarray(bin_centers)
-    mean_flu    = np.asarray(mean_flu)
-    zone_mask   = (bin_centers >= ZONE_LO) & (bin_centers <= ZONE_HI)
-    zone_width  = ZONE_HI - ZONE_LO
-    n_zone      = zone_mask.sum()
-    if n_zone >= 2:
-        zone_integral = float(np.trapezoid(mean_flu[zone_mask], bin_centers[zone_mask]))
-    elif n_zone == 1:
-        zone_integral = float(mean_flu[zone_mask][0] * bin_width_cm)
-    else:
-        zone_integral = 0.0
-    zone_norm_mw  = zone_integral / zone_width
-    dose_lines    = [f"  {t // 60:.0f} min:  {zone_norm_mw * 1e-3 * t:.4f} J/cm²"
-                     for t in treatment_times_s]
-    cart_doses    = [f"  {t // 60:.0f} min:  {cartilage_flu_mw * 1e-3 * t:.4f} J/cm²"
-                     for t in treatment_times_s]
-    syn_doses     = [f"  {t // 60:.0f} min:  {synovial_flu_mw * 1e-3 * t:.4f} J/cm²"
-                     for t in treatment_times_s]
-    annot_text = (
-        f"<b>Zone {ZONE_LO}–{ZONE_HI} cm  ∫F·dz / Δz</b><br>"
-        f"Norm. fluence rate: {zone_norm_mw:.4f} mW/cm²<br>"
-        + "<br>".join(dose_lines)
-        + f"<br><br><b>Cartilage (vol-weighted)</b><br>"
-        + f"Fluence rate: {cartilage_flu_mw:.4f} mW/cm²<br>"
-        + "<br>".join(cart_doses)
-        + f"<br><br><b>Synovial Fluid</b><br>"
-        + f"Fluence rate: {synovial_flu_mw:.4f} mW/cm²<br>"
-        + "<br>".join(syn_doses)
-    )
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=bin_centers, y=mean_flu, width=bin_width_cm * 0.85,
-        marker=dict(color=mean_flu, colorscale='Hot', reversescale=True,
-                    showscale=True,
-                    colorbar=dict(title=dict(text='mW/cm²', side='right'),
-                                  thickness=15, len=0.6)),
-        name='Mean Fluence Rate',
-    ))
-    max_depth = float(bin_centers[-1]) + bin_width_cm / 2 if len(bin_centers) else 6.0
-    for depth, label in DEPTH_REFS:
-        if depth <= max_depth:
-            fig.add_shape(type='line', x0=depth, x1=depth, y0=0, y1=1,
-                          xref='x', yref='paper',
-                          line=dict(color='rgba(100,200,255,0.55)', width=1, dash='dash'))
-            fig.add_annotation(x=depth, y=1, xref='x', yref='paper',
-                                text=label, showarrow=False,
-                                font=dict(size=9, color='#8b949e'),
-                                xanchor='left', yanchor='bottom', xshift=3)
-    fig.add_annotation(x=0.98, y=0.98, xref='paper', yref='paper',
-                        text=annot_text, showarrow=False, align='left',
-                        xanchor='right', yanchor='top',
-                        font=dict(size=10, color='#e6edf3'),
-                        bgcolor='rgba(22,27,34,0.85)', bordercolor='#30363d',
-                        borderwidth=1, borderpad=6)
-    fig.update_layout(
-        title=dict(text=f'Fluence Rate vs Penetration Depth — {subject_id} ({wavelength_nm} nm) Elbow',
-                   font=dict(size=14)),
-        xaxis=dict(title='Penetration Depth from Skin Surface (cm)',
-                   gridcolor='#30363d', zeroline=False, dtick=0.25),
-        yaxis=dict(title='Mean Fluence Rate (mW/cm²)', type='log',
-                   gridcolor='#30363d', zeroline=False),
-        paper_bgcolor='#0d1117', plot_bgcolor='#161b22',
-        font_color='#e6edf3',
-        legend=dict(bgcolor='#161b22', bordercolor='#30363d', borderwidth=1),
-        margin=dict(l=70, r=20, t=55, b=55), bargap=0.05,
-    )
-    return fig
 
 
 # ─────────────────────────────────────────────────────────────────────────────
