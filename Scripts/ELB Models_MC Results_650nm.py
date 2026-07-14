@@ -344,7 +344,7 @@ if __name__ == "__main__":
     #   humerus_distal_raw.stl, radius_raw.stl, ulna_raw.stl,
     #   capitellum_cartilage_raw.stl, radial_head_cartilage_raw.stl,
     #   trochlear_cartilage_raw.stl, annular_lig_raw.stl
-    SUBJECT_IDS = []   # e.g. ["ELB001", "ELB002"]
+    SUBJECT_IDS = ["ELB001"]   # e.g. ["ELB001", "ELB002"]
 
     BASE_DIR   = Path(".")
     RUN_ID     = datetime.now().strftime("%Y%m%d_%H%M%S")
